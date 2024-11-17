@@ -11,6 +11,9 @@ export type FetchParams = {
   issueNum?: number;
   owner?: string;
   repo?: string;
+  currentDepth?: number; // Current depth in the tree
+  maxDepth?: number; // Maximum depth to traverse
+  parentIssueKey?: string; // Parent issue key (Tree structure)
 };
 
 export type LinkedIssues = {
