@@ -1,9 +1,10 @@
 import { Context } from "../types";
 import { StreamlinedComment, TokenLimits } from "../types/llm";
-import { fetchPullRequestDiff, fetchIssue } from "./issue-fetching";
+import { fetchIssue } from "./issue-fetching";
 import { splitKey } from "./issue";
 import { logger } from "./errors";
 import { Issue } from "../types/github-types";
+import { encode } from "gpt-tokenizer";
 
 interface TreeNode {
   key: string;
@@ -13,32 +14,28 @@ interface TreeNode {
   depth: number;
   comments?: StreamlinedComment[];
   body?: string;
-  prDetails?: {
-    diff?: string | null;
-    files?: {
-      filename: string;
-      changes: string;
-    }[];
-  };
+  similarIssues?: Issue[];
+  codeSnippets?: { body: string; path: string }[];
+  readmeSection?: string;
+}
+
+function updateTokenCount(text: string, tokenLimits: TokenLimits): void {
+  const tokenCount = encode(text, { disallowedSpecial: new Set() }).length;
+  tokenLimits.runningTokenCount += tokenCount;
+  tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens - tokenLimits.runningTokenCount;
 }
 
 function validateGitHubKey(key: string): boolean {
-  // A valid key must be in the format owner/repo/number where:
-  // - owner cannot be 'issues' (malformed cross-repo reference)
-  // - owner and repo must be valid GitHub usernames/repo names (alphanumeric with hyphens and underscores)
-  // - number must be digits only
   const parts = key.split("/");
 
   if (parts.length !== 3) return false;
 
   const [owner, repo, number] = parts;
 
-  // Owner validation
   if (!owner || owner === "issues" || !/^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/i.test(owner)) {
     return false;
   }
 
-  // Repo validation
   if (!repo || !/^[a-zA-Z0-9-_]+$/i.test(repo)) {
     return false;
   }
@@ -48,7 +45,6 @@ function validateGitHubKey(key: string): boolean {
 
 function extractGitHubInfo(url: string): { owner: string; repo: string; number: string } | null {
   try {
-    // Handle full GitHub URLs
     const urlMatch = url.match(/github\.com\/([^/]+)\/([^/]+?)\/(issues|pull)\/(\d+)/);
     if (urlMatch) {
       return {
@@ -58,7 +54,6 @@ function extractGitHubInfo(url: string): { owner: string; repo: string; number: 
       };
     }
 
-    // Handle org/repo#number format
     const repoMatch = url.match(/([^/\s]+)\/([^/\s#]+)#(\d+)/);
     if (repoMatch) {
       return {
@@ -74,64 +69,56 @@ function extractGitHubInfo(url: string): { owner: string; repo: string; number: 
   }
 }
 
-async function extractReferencedIssuesAndPrs(body: string, owner: string, repo: string, context: Context): Promise<string[]> {
+async function extractReferencedIssuesAndPrs(body: string, owner: string, repo: string): Promise<string[]> {
   const links = new Set<string>();
   const processedRefs = new Set<string>();
 
-  function addValidReference(key: string, source: string) {
-    // Remove any square brackets that might have been included
+  function addValidReference(key: string) {
     key = key.replace(/[[]]/g, "");
 
     if (!validateGitHubKey(key)) {
-      context.logger.info(`Invalid GitHub key format: ${key} from ${source}`);
       return;
     }
     if (!processedRefs.has(key)) {
-      context.logger.info(`Adding reference ${key} from ${source}`);
       processedRefs.add(key);
       links.add(key);
     }
   }
 
-  // Match issue/PR references like #123 in the current repo
   const numberRefs = body.match(/(?:^|\s)#(\d+)(?:\s|$)/g) || [];
   for (const ref of numberRefs) {
     const number = ref.trim().substring(1);
     if (/^\d+$/.test(number)) {
       const key = `${owner}/${repo}/${number}`;
-      addValidReference(key, "local reference");
+      addValidReference(key);
     }
   }
 
-  // Match "Resolves/Closes/Fixes #X" patterns
   const resolveRefs = body.match(/(?:Resolves|Closes|Fixes)\s+#(\d+)/gi) || [];
   for (const ref of resolveRefs) {
     const number = ref.split("#")[1];
     if (/^\d+$/.test(number)) {
       const key = `${owner}/${repo}/${number}`;
-      addValidReference(key, "resolution reference");
+      addValidReference(key);
     }
   }
 
-  // Match full GitHub URLs
   const urlMatches = body.match(/https:\/\/(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+?)\/(issues|pull)\/(\d+)(?:#[^/\s]*)?/g) || [];
   for (const url of urlMatches) {
     const info = extractGitHubInfo(url);
     if (info) {
       const key = `${info.owner}/${info.repo}/${info.number}`;
-      addValidReference(key, "URL reference");
+      addValidReference(key);
     }
   }
 
-  // Match cross-repo references (org/repo#number)
   const crossRepoMatches = body.match(/([^/\s]+)\/([^/\s#]+)#(\d+)/g) || [];
   for (const ref of crossRepoMatches) {
     const parts = ref.match(/([^/\s]+)\/([^/\s#]+)#(\d+)/);
     if (parts) {
       const key = `${parts[1]}/${parts[2]}/${parts[3]}`;
       if (validateGitHubKey(key)) {
-        // Additional validation check
-        addValidReference(key, "cross-repo reference");
+        addValidReference(key);
       }
     }
   }
@@ -143,12 +130,12 @@ async function buildTree(
   context: Context,
   streamlined: Record<string, StreamlinedComment[]>,
   specAndBodies: Record<string, string>,
-  tokenLimits: TokenLimits
+  tokenLimits: TokenLimits,
+  maxDepth: number = 2
 ): Promise<TreeNode | null> {
   const processedNodes = new Map<string, TreeNode>();
   const mainIssueKey = `${context.payload.repository.owner.login}/${context.payload.repository.name}/${context.payload.issue.number}`;
-  const maxDepth = 15;
-  const linkedIssues = new Set<string>(); // Track all issues that have been linked anywhere in the tree
+  const linkedIssues = new Set<string>();
   const failedFetches = new Set<string>();
   const processingStack = new Set<string>();
 
@@ -157,50 +144,38 @@ async function buildTree(
     return null;
   }
 
-  async function findReferences(content: string, owner: string, repo: string): Promise<string[]> {
-    const refs = await extractReferencedIssuesAndPrs(content, owner, repo, context);
-    return refs.filter(
-      (ref) => validateGitHubKey(ref) && !failedFetches.has(ref) && !linkedIssues.has(ref) // Only include refs that haven't been linked yet
-    );
-  }
-
   async function createNode(key: string, depth: number = 0): Promise<TreeNode | null> {
-    // Prevent infinite recursion and respect max depth
     if (depth > maxDepth || processingStack.has(key)) {
       return processedNodes.get(key) || null;
     }
 
-    // Return existing node if already processed
     if (processedNodes.has(key)) {
-      const existingNode = processedNodes.get(key);
-      if (existingNode) {
-        return existingNode;
-      }
+      return processedNodes.get(key) || null;
     }
 
-    // Don't retry failed fetches
     if (failedFetches.has(key)) {
       return null;
     }
 
-    // Add to processing stack to prevent cycles
     processingStack.add(key);
 
     try {
       const [owner, repo, issueNum] = splitKey(key);
-      const issue = await fetchIssue({
-        context,
-        owner,
-        repo,
-        issueNum: parseInt(issueNum),
-      });
+      const issue = await fetchIssue(
+        {
+          context,
+          owner,
+          repo,
+          issueNum: parseInt(issueNum),
+        },
+        tokenLimits
+      );
 
       if (!issue) {
         failedFetches.add(key);
         return null;
       }
 
-      // Create the node first
       const node: TreeNode = {
         key,
         issue,
@@ -210,29 +185,25 @@ async function buildTree(
         body: specAndBodies[key] || issue.body || undefined,
       };
 
-      // Store node immediately to prevent cycles
       processedNodes.set(key, node);
-      linkedIssues.add(key); // Mark this issue as linked
+      linkedIssues.add(key);
 
-      // Collect all references
       const references = new Set<string>();
-      // Add references from body
+
       if (node.body) {
-        const bodyRefs = await findReferences(node.body, owner, repo);
+        const bodyRefs = await extractReferencedIssuesAndPrs(node.body, owner, repo);
         bodyRefs.forEach((ref) => references.add(ref));
       }
 
-      // Add references from comments
       if (node.comments) {
         for (const comment of node.comments) {
           if (comment.body) {
-            const commentRefs = await findReferences(comment.body, owner, repo);
+            const commentRefs = await extractReferencedIssuesAndPrs(comment.body, owner, repo);
             commentRefs.forEach((ref) => references.add(ref));
           }
         }
       }
 
-      // Special handling for PR targets
       if (issue.pull_request && node.body) {
         const resolveMatches = node.body.match(/(?:Resolves|Closes|Fixes)\s+#(\d+)/gi);
         if (resolveMatches) {
@@ -246,38 +217,13 @@ async function buildTree(
         }
       }
 
-      // Process all references as children
+      // Process all references regardless of token count
       for (const ref of references) {
-        // Double check that the reference hasn't been linked while we were processing
         if (!linkedIssues.has(ref)) {
           const childNode = await createNode(ref, depth + 1);
           if (childNode) {
             childNode.parent = node;
             node.children.push(childNode);
-
-            // Fetch PR details for PR nodes
-            if (childNode.issue.pull_request) {
-              try {
-                const [childOwner, childRepo, childNum] = splitKey(ref);
-                const { diff } = await fetchPullRequestDiff(context, childOwner, childRepo, parseInt(childNum), tokenLimits);
-
-                const filesResponse = await context.octokit.pulls.listFiles({
-                  owner: childOwner,
-                  repo: childRepo,
-                  pull_number: parseInt(childNum),
-                });
-
-                childNode.prDetails = {
-                  diff: diff || undefined,
-                  files: filesResponse.data.map((file) => ({
-                    filename: file.filename,
-                    changes: `${file.additions} additions, ${file.deletions} deletions, ${file.changes} changes`,
-                  })),
-                };
-              } catch (error) {
-                logger.error(`Error fetching PR details for ${ref}: ${error}`);
-              }
-            }
           }
         }
       }
@@ -300,64 +246,105 @@ async function buildTree(
   }
 }
 
-async function processTreeNode(node: TreeNode, prefix: string, output: string[]): Promise<void> {
+async function processTreeNode(node: TreeNode, prefix: string, output: string[], tokenLimits: TokenLimits): Promise<void> {
   const isPullRequest = node.issue.pull_request;
   const typeStr = isPullRequest ? "PR" : "Issue";
   const numberStr = `#${node.issue.number}`;
   const urlStr = `(${node.issue.html_url})`;
 
-  // Add node header
-  output.push(`${prefix}${node.parent ? "└── " : ""}${typeStr} ${numberStr} ${urlStr}`);
+  // Check token limit before adding this node
+  const headerLine = `${prefix}${node.parent ? "└── " : ""}${typeStr} ${numberStr} ${urlStr}`;
+  const headerTokens = encode(headerLine, { disallowedSpecial: new Set() }).length;
+
+  if (tokenLimits.runningTokenCount + headerTokens > tokenLimits.tokensRemaining) {
+    return; // Stop here if we can't add even the header
+  }
+
+  updateTokenCount(headerLine, tokenLimits);
+  output.push(headerLine);
 
   const childPrefix = prefix + (node.parent ? "    " : "");
   const contentPrefix = childPrefix + "    ";
 
-  // Add body
   if (node.body) {
-    output.push(`${childPrefix}Body:`);
-    const bodyLines = node.body.trim().split("\n");
-    bodyLines.forEach((line) => {
-      if (line.trim()) {
-        output.push(`${contentPrefix}${line.trim()}`);
-      }
-    });
-    output.push("");
-  }
+    const bodyHeader = `${childPrefix}Body:`;
+    const bodyHeaderTokens = encode(bodyHeader, { disallowedSpecial: new Set() }).length;
 
-  // Add PR details
-  if (isPullRequest && node.prDetails) {
-    if (node.prDetails.files && node.prDetails.files.length > 0) {
-      output.push(`${childPrefix}Files Changed:`);
-      node.prDetails.files.forEach((file) => {
-        output.push(`${contentPrefix}- ${file.filename} (${file.changes})`);
-      });
-      output.push("");
-    }
+    if (tokenLimits.runningTokenCount + bodyHeaderTokens <= tokenLimits.tokensRemaining) {
+      updateTokenCount(bodyHeader, tokenLimits);
+      output.push(bodyHeader);
 
-    if (node.prDetails.diff) {
-      output.push(`${childPrefix}Diff Preview:`);
-      const diffLines = node.prDetails.diff.split("\n").slice(0, 5);
-      diffLines.forEach((line) => {
-        output.push(`${contentPrefix}${line}`);
-      });
-      if (node.prDetails.diff.split("\n").length > 5) {
-        output.push(`${contentPrefix}...`);
+      const bodyLines = node.body.trim().split("\n");
+      for (const line of bodyLines) {
+        if (line.trim()) {
+          const formattedLine = `${contentPrefix}${line.trim()}`;
+          const lineTokens = encode(formattedLine, { disallowedSpecial: new Set() }).length;
+
+          if (tokenLimits.runningTokenCount + lineTokens > tokenLimits.tokensRemaining) {
+            break; // Stop adding body lines if we hit the limit
+          }
+
+          updateTokenCount(formattedLine, tokenLimits);
+          output.push(formattedLine);
+        }
       }
       output.push("");
     }
   }
 
-  // Add comments
+  // Add PR diff information if available
+  if (isPullRequest && node.issue.prDetails?.diff) {
+    const diffHeader = `${childPrefix}Diff:`;
+    const diffHeaderTokens = encode(diffHeader, { disallowedSpecial: new Set() }).length;
+
+    if (tokenLimits.runningTokenCount + diffHeaderTokens <= tokenLimits.tokensRemaining) {
+      updateTokenCount(diffHeader, tokenLimits);
+      output.push(diffHeader);
+
+      const diffLines = node.issue.prDetails.diff.trim().split("\n");
+      for (const line of diffLines) {
+        if (line.trim()) {
+          const formattedLine = `${contentPrefix}${line.trim()}`;
+          const lineTokens = encode(formattedLine, { disallowedSpecial: new Set() }).length;
+
+          if (tokenLimits.runningTokenCount + lineTokens > tokenLimits.tokensRemaining) {
+            break; // Stop adding diff lines if we hit the limit
+          }
+
+          updateTokenCount(formattedLine, tokenLimits);
+          output.push(formattedLine);
+        }
+      }
+      output.push("");
+    }
+  }
+
   if (node.comments && node.comments.length > 0) {
-    output.push(`${childPrefix}Comments: ${node.comments.length}`);
-    node.comments.forEach((comment, index) => {
-      if (comment.body) {
-        const isLast = node.comments && index === node.comments.length - 1;
-        const commentPrefix = isLast ? "└── " : "├── ";
-        output.push(`${childPrefix}${commentPrefix}issuecomment-${comment.id}: ${comment.user}: ${comment.body.trim()}`);
+    const commentsHeader = `${childPrefix}Comments: ${node.comments.length}`;
+    const headerTokens = encode(commentsHeader, { disallowedSpecial: new Set() }).length;
+
+    if (tokenLimits.runningTokenCount + headerTokens <= tokenLimits.tokensRemaining) {
+      updateTokenCount(commentsHeader, tokenLimits);
+      output.push(commentsHeader);
+
+      for (let i = 0; i < node.comments.length; i++) {
+        const comment = node.comments[i];
+        if (comment.body) {
+          const isLast = i === node.comments.length - 1;
+          const commentPrefix = isLast ? "└── " : "├── ";
+          const commentLine = `${childPrefix}${commentPrefix}issuecomment-${comment.id}: ${comment.user}: ${comment.body.trim()}`;
+          const commentTokens = encode(commentLine, { disallowedSpecial: new Set() }).length;
+
+          if (tokenLimits.runningTokenCount + commentTokens > tokenLimits.tokensRemaining) {
+            break; // Stop adding comments if we hit the limit
+          }
+
+          updateTokenCount(commentLine, tokenLimits);
+          output.push(commentLine);
+        }
       }
-    });
-    output.push("");
+      output.push("");
+    }
   }
 
   // Process children
@@ -365,14 +352,24 @@ async function processTreeNode(node: TreeNode, prefix: string, output: string[])
     const child = node.children[i];
     const isLast = i === node.children.length - 1;
     const nextPrefix = childPrefix + (isLast ? "    " : "│   ");
-    await processTreeNode(child, nextPrefix, output);
+
+    // Check if we have enough tokens for at least the child's header
+    const childHeaderLine = `${nextPrefix}${child.parent ? "└── " : ""}${child.issue.pull_request ? "PR" : "Issue"} #${child.issue.number} (${child.issue.html_url})`;
+    const childHeaderTokens = encode(childHeaderLine, { disallowedSpecial: new Set() }).length;
+
+    if (tokenLimits.runningTokenCount + childHeaderTokens > tokenLimits.tokensRemaining) {
+      break; // Stop processing children if we can't even add their headers
+    }
+
+    await processTreeNode(child, nextPrefix, output, tokenLimits);
   }
 }
 
 export async function formatChatHistory(
   context: Context,
   streamlined: Record<string, StreamlinedComment[]>,
-  specAndBodies: Record<string, string>
+  specAndBodies: Record<string, string>,
+  maxDepth: number = 2
 ): Promise<string[]> {
   const tokenLimits: TokenLimits = {
     modelMaxTokenLimit: context.adapters.openai.completions.getModelMaxTokenLimit(context.config.model),
@@ -383,26 +380,23 @@ export async function formatChatHistory(
 
   tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens;
 
-  // Build tree structure
-  const tree = await buildTree(context, streamlined, specAndBodies, tokenLimits);
+  const tree = await buildTree(context, streamlined, specAndBodies, tokenLimits, maxDepth);
   if (!tree) {
     return ["No main issue found."];
   }
 
+  // Reset token count before processing tree for output
+  tokenLimits.runningTokenCount = 0;
+  tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens;
+
   const treeOutput: string[] = [];
-  treeOutput.push("Issue Tree Structure:");
+  const headerLine = "Issue Tree Structure:";
+  updateTokenCount(headerLine, tokenLimits);
+  treeOutput.push(headerLine);
   treeOutput.push("");
 
-  // Process tree
-  await processTreeNode(tree, "", treeOutput);
-
-  const result = treeOutput.join("\n");
-  const tokenCount = await context.adapters.openai.completions.findTokenLength(result);
-
-  if (tokenCount > tokenLimits.tokensRemaining) {
-    logger.error("Tree structure exceeds token limit");
-    return ["Tree structure exceeds token limit"];
-  }
+  await processTreeNode(tree, "", treeOutput, tokenLimits);
+  logger.info(`Final token count: ${tokenLimits.runningTokenCount}/${tokenLimits.tokensRemaining} tokens used`);
 
   return treeOutput;
 }

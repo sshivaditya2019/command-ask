@@ -4,8 +4,6 @@ import { logger } from "./errors";
 import { EncodeOptions } from "gpt-tokenizer/esm/GptEncoding";
 
 export async function processPullRequestDiff(diff: string, tokenLimits: TokenLimits) {
-  const { runningTokenCount, tokensRemaining } = tokenLimits;
-
   // parse the diff into per-file diffs for quicker processing
   const perFileDiffs = parsePerFileDiffs(diff);
 
@@ -17,24 +15,28 @@ export async function processPullRequestDiff(diff: string, tokenLimits: TokenLim
 
   estimatedFileDiffStats.sort((a, b) => a.estimatedTokenCount - b.estimatedTokenCount); // Smallest first
 
-  let currentTokenCount = runningTokenCount;
   const includedFileDiffs = [];
 
   // Using the quick estimate, include as many files as possible without exceeding token limits
   for (const file of estimatedFileDiffStats) {
-    if (currentTokenCount + file.estimatedTokenCount > tokensRemaining) {
-      logger.info(`Skipping ${file.filename} to stay within token limits.`);
+    if (tokenLimits.runningTokenCount + file.estimatedTokenCount > tokenLimits.tokensRemaining) {
+      logger.info(`Skipping ${file.filename} content to stay within token limits.`);
       continue;
     }
     includedFileDiffs.push(file);
-    currentTokenCount += file.estimatedTokenCount;
+    tokenLimits.runningTokenCount += file.estimatedTokenCount;
+    tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens - tokenLimits.runningTokenCount;
   }
 
-  // If no files can be included, return null
+  // If no files can be included, return just the file list without diff content
   if (includedFileDiffs.length === 0) {
     logger.error(`Cannot include any files from diff without exceeding token limits.`);
     return { diff: null };
   }
+
+  // Reset running count before accurate calculation
+  tokenLimits.runningTokenCount -= includedFileDiffs.reduce((sum, file) => sum + file.estimatedTokenCount, 0);
+  tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens - tokenLimits.runningTokenCount;
 
   // Accurately calculate token count for included files we have approximated to be under the limit
   const accurateFileDiffStats = await Promise.all(
@@ -46,13 +48,24 @@ export async function processPullRequestDiff(diff: string, tokenLimits: TokenLim
   );
 
   // Take an accurate reading of our current collection of files within the diff
-  currentTokenCount = accurateFileDiffStats.reduce((sum, file) => sum + file.tokenCount, runningTokenCount);
+  for (const file of accurateFileDiffStats) {
+    tokenLimits.runningTokenCount += file.tokenCount;
+    tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens - tokenLimits.runningTokenCount;
+    logger.info(
+      `Added ${file.tokenCount} tokens for ${file.filename}. Running total: ${tokenLimits.runningTokenCount}. Remaining: ${tokenLimits.tokensRemaining}`
+    );
+  }
 
   // Remove files from the end of the list until we are within token limits
-  while (currentTokenCount > tokensRemaining && accurateFileDiffStats.length > 0) {
+  while (tokenLimits.runningTokenCount > tokenLimits.tokensRemaining && accurateFileDiffStats.length > 0) {
     const removedFile = accurateFileDiffStats.pop();
-    currentTokenCount -= removedFile?.tokenCount || 0;
-    logger.info(`Excluded ${removedFile?.filename || "Unknown filename"} after accurate token count exceeded limits.`);
+    if (removedFile) {
+      tokenLimits.runningTokenCount -= removedFile.tokenCount;
+      tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens - tokenLimits.runningTokenCount;
+      logger.info(
+        `Excluded ${removedFile.filename} content after accurate token count exceeded limits. Removed ${removedFile.tokenCount} tokens. New total: ${tokenLimits.runningTokenCount}`
+      );
+    }
   }
 
   if (accurateFileDiffStats.length === 0) {

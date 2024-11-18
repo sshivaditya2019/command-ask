@@ -15,13 +15,15 @@ export async function askQuestion(context: Context, question: string) {
   // using any links in comments or issue/pr bodies to fetch more context
   const { specAndBodies, streamlinedComments } = await recursivelyFetchLinkedIssues({
     context,
+    maxDepth: 2,
     owner: context.payload.repository.owner.login,
     repo: context.payload.repository.name,
+    issueNum: context.payload.issue.number,
   });
   // build a nicely structure system message containing a streamlined chat history
   // includes the current issue, any linked issues, and any linked PRs
-  const formattedChat = await formatChatHistory(context, streamlinedComments, specAndBodies);
-  logger.info(`${formattedChat.join("")}`);
+  const formattedChat = await formatChatHistory(context, streamlinedComments, specAndBodies, 2);
+  logger.info("Formatted chat history" + formattedChat.join("\n"));
   return await askLlm(context, question, formattedChat);
 }
 
@@ -36,6 +38,7 @@ export async function askLlm(context: Context, question: string, formattedChat: 
     },
   } = context;
 
+  context.logger.info("Asking LLM question: " + question);
   try {
     // using db functions to find similar comments and issues
     const [similarComments, similarIssues] = await Promise.all([
@@ -49,6 +52,8 @@ export async function askLlm(context: Context, question: string, formattedChat: 
       ...(similarIssues?.map((issue: IssueSimilaritySearchResult) => issue.issue_plaintext) || []),
     ];
 
+    context.logger.info("Similar text: " + similarText.join("\n"));
+
     // filter out any empty strings
     formattedChat = formattedChat.filter((text) => text);
 
@@ -57,6 +62,7 @@ export async function askLlm(context: Context, question: string, formattedChat: 
     // gather structural data about the payload repository
     const [languages, { dependencies, devDependencies }] = await Promise.all([fetchRepoLanguageStats(context), fetchRepoDependencies(context)]);
 
+    context.logger.info("Languages: " + languages.join(", "));
     let groundTruths: string[] = [];
 
     if (!languages.length) {

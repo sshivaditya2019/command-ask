@@ -118,6 +118,11 @@ export class Completions extends SuperOpenAi {
       },
     });
 
+    if (!res.choices || !res.choices[0].message) {
+      logger.error(`Failed to generate completion: ${JSON.stringify(res)}`);
+      return { answer: "", tokenUsage: { input: 0, output: 0, total: 0 }, groundTruths };
+    }
+
     const answer = res.choices[0].message;
     if (answer && answer.content && res.usage) {
       return {
@@ -160,6 +165,11 @@ export class Completions extends SuperOpenAi {
       messages: msgs,
       model: model,
     });
+
+    if (!res.choices || !res.choices[0].message || !res.choices[0].message.content) {
+      this.context.logger.error(`Failed to generate ground truth completion: ${JSON.stringify(res)}`);
+      return null;
+    }
 
     return res.choices[0].message.content;
   }

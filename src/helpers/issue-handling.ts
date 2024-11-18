@@ -1,14 +1,49 @@
 import { createKey } from "../handlers/comments";
-import { FetchParams } from "../types/github-types";
-import { StreamlinedComment } from "../types/llm";
-import { idIssueFromComment, mergeStreamlinedComments, splitKey } from "./issue";
+import { FetchParams, User } from "../types/github-types";
+import { StreamlinedComment, TokenLimits } from "../types/llm";
+import { idIssueFromComment, mergeStreamlinedComments, splitKey, fetchSimilarIssues, fetchCodeLinkedFromIssue, pullReadmeFromRepoForIssue } from "./issue";
 import { fetchLinkedIssues, fetchIssue, mergeCommentsAndFetchSpec } from "./issue-fetching";
+import { encode } from "gpt-tokenizer";
+
+function createStreamlinedComment(params: {
+  id: string | number;
+  body: string;
+  user: Partial<User> | null | string;
+  org: string;
+  repo: string;
+  issueUrl: string;
+}): StreamlinedComment {
+  return {
+    id: typeof params.id === "string" ? parseInt(params.id.replace(/\D/g, "")) : params.id,
+    user: typeof params.user === "string" ? params.user : params.user?.login,
+    body: params.body,
+    org: params.org,
+    repo: params.repo,
+    issueUrl: params.issueUrl,
+  };
+}
+
+function updateTokenCount(text: string, tokenLimits: TokenLimits): void {
+  const tokenCount = encode(text, { disallowedSpecial: new Set() }).length;
+  tokenLimits.runningTokenCount += tokenCount;
+  tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens - tokenLimits.runningTokenCount;
+}
+
+function createDefaultTokenLimits(params: FetchParams): TokenLimits {
+  return {
+    modelMaxTokenLimit: params.context.adapters.openai.completions.getModelMaxTokenLimit(params.context.config.model),
+    maxCompletionTokens: params.context.config.maxTokens,
+    runningTokenCount: 0,
+    tokensRemaining: 0,
+  };
+}
 
 export async function handleIssue(
   params: FetchParams,
   streamlinedComments: Record<string, StreamlinedComment[]>,
   alreadySeen: Set<string>,
-  parentKey?: string
+  parentKey?: string,
+  tokenLimits?: TokenLimits
 ) {
   const currentKey = `${params.owner}/${params.repo}/${params.issueNum}`;
   if (alreadySeen.has(currentKey)) {
@@ -18,15 +53,49 @@ export async function handleIssue(
   // Mark this issue as seen
   alreadySeen.add(currentKey);
 
+  const currentTokenLimits = tokenLimits || createDefaultTokenLimits(params);
+
   const {
     linkedIssues,
     seen,
     specAndBodies,
     streamlinedComments: streamlined,
-  } = await fetchLinkedIssues({
-    ...params,
-    parentIssueKey: parentKey, // Pass parent key to maintain hierarchy
-  });
+  } = await fetchLinkedIssues(
+    {
+      ...params,
+      parentIssueKey: parentKey,
+    },
+    currentTokenLimits
+  );
+
+  // Only fetch similar issues and README for the main issue (no parent key)
+  if (!parentKey) {
+    const issueBody = params.context.payload.issue?.body || "";
+    const [similarIssues, readmeSection] = await Promise.all([fetchSimilarIssues(params.context, issueBody), pullReadmeFromRepoForIssue(params)]);
+
+    // Add similar issues at the 0th level
+    linkedIssues.push(...similarIssues);
+
+    // Add README content as a top-level comment if relevant
+    if (readmeSection) {
+      updateTokenCount(readmeSection, currentTokenLimits);
+
+      if (!streamlined[currentKey]) {
+        streamlined[currentKey] = [];
+      }
+
+      streamlined[currentKey].push(
+        createStreamlinedComment({
+          id: "readme-section",
+          body: `Relevant README section:\n${readmeSection}`,
+          user: params.context.payload.sender,
+          org: params.owner || "",
+          repo: params.repo || "",
+          issueUrl: params.context.payload.issue?.html_url || "",
+        })
+      );
+    }
+  }
 
   // Merge seen sets to maintain global reference tracking
   for (const seenKey of seen) {
@@ -42,12 +111,12 @@ export async function handleIssue(
     return await mergeCommentsAndFetchSpec(
       {
         ...params,
-        parentIssueKey: currentKey, // Set current issue as parent
+        parentIssueKey: currentKey,
       },
       linkedIssue,
       streamlinedComments,
       specAndBodies,
-      alreadySeen // Pass the global seen set
+      alreadySeen
     );
   });
 
@@ -61,11 +130,15 @@ export async function handleSpec(
   specAndBodies: Record<string, string>,
   key: string,
   seen: Set<string>,
-  streamlinedComments: Record<string, StreamlinedComment[]>
+  streamlinedComments: Record<string, StreamlinedComment[]>,
+  tokenLimits?: TokenLimits
 ) {
   if (seen.has(key)) {
     return specAndBodies;
   }
+
+  const currentTokenLimits = tokenLimits || createDefaultTokenLimits(params);
+  updateTokenCount(specOrBody, currentTokenLimits);
 
   specAndBodies[key] = specOrBody;
   const otherReferences = idIssueFromComment(specOrBody, params);
@@ -78,27 +151,25 @@ export async function handleSpec(
       }
 
       seen.add(anotherKey);
-      const issue = await fetchIssue({
-        ...params,
-        owner: ref.owner,
-        repo: ref.repo,
-        issueNum: ref.issueNumber,
-      });
+      const issue = await fetchIssue(
+        {
+          ...params,
+          owner: ref.owner,
+          repo: ref.repo,
+          issueNum: ref.issueNumber,
+        },
+        currentTokenLimits
+      );
 
       if (!issue?.body) {
         continue;
       }
 
+      updateTokenCount(issue.body, currentTokenLimits);
       specAndBodies[anotherKey] = issue.body;
 
       if (!streamlinedComments[anotherKey]) {
-        // Pass the current key as parent to maintain hierarchy
-        await handleIssue(
-          { ...params, owner: ref.owner, repo: ref.repo, issueNum: ref.issueNumber },
-          streamlinedComments,
-          seen, // Pass the same seen set
-          key
-        );
+        await handleIssue({ ...params, owner: ref.owner, repo: ref.repo, issueNum: ref.issueNumber }, streamlinedComments, seen, key, currentTokenLimits);
       }
     }
   }
@@ -110,9 +181,44 @@ export async function handleComment(
   comment: StreamlinedComment,
   streamlinedComments: Record<string, StreamlinedComment[]>,
   seen: Set<string>,
-  parentKey: string
+  parentKey: string,
+  tokenLimits?: TokenLimits
 ) {
-  const otherReferences = idIssueFromComment(comment.body, params);
+  const commentBody = comment.body || "";
+  const currentTokenLimits = tokenLimits || createDefaultTokenLimits(params);
+
+  updateTokenCount(commentBody, currentTokenLimits);
+
+  const otherReferences = idIssueFromComment(commentBody, params);
+
+  // Only fetch code snippets for comments (no similar issues)
+  const codeSnippets = await fetchCodeLinkedFromIssue(commentBody, params.context, comment.issueUrl);
+
+  // Add code snippets as comments if found
+  if (codeSnippets.length > 0) {
+    const commentKey = `${params.owner}/${params.repo}/${params.issueNum}`;
+    if (!streamlinedComments[commentKey]) {
+      streamlinedComments[commentKey] = [];
+    }
+
+    codeSnippets.forEach((snippet) => {
+      if (snippet.body) {
+        updateTokenCount(snippet.body, currentTokenLimits);
+      }
+
+      streamlinedComments[commentKey].push(
+        createStreamlinedComment({
+          id: `code-${snippet.id}`,
+          body: `Code from ${snippet.id}:\n\`\`\`\n${snippet.body || ""}\n\`\`\``,
+          user: params.context.payload.sender,
+          org: snippet.org,
+          repo: snippet.repo,
+          issueUrl: snippet.issueUrl,
+        })
+      );
+    });
+  }
+
   if (otherReferences) {
     for (const ref of otherReferences) {
       const key = `${ref.owner}/${ref.repo}/${ref.issueNumber}`;
@@ -122,14 +228,21 @@ export async function handleComment(
 
       seen.add(key);
       if (!streamlinedComments[key]) {
-        await handleIssue({ ...params, owner: ref.owner, repo: ref.repo, issueNum: ref.issueNumber }, streamlinedComments, seen, parentKey);
+        await handleIssue({ ...params, owner: ref.owner, repo: ref.repo, issueNum: ref.issueNumber }, streamlinedComments, seen, parentKey, currentTokenLimits);
       }
     }
   }
 }
 
-export async function handleSpecAndBodyKeys(keys: string[], params: FetchParams, streamlinedComments: Record<string, StreamlinedComment[]>, seen: Set<string>) {
-  // Process each key while maintaining parent-child relationships
+export async function handleSpecAndBodyKeys(
+  keys: string[],
+  params: FetchParams,
+  streamlinedComments: Record<string, StreamlinedComment[]>,
+  seen: Set<string>,
+  tokenLimits?: TokenLimits
+) {
+  const currentTokenLimits = tokenLimits || createDefaultTokenLimits(params);
+
   const commentProcessingPromises = keys.map(async (key) => {
     if (seen.has(key)) {
       return;
@@ -138,13 +251,12 @@ export async function handleSpecAndBodyKeys(keys: string[], params: FetchParams,
     const [owner, repo, issueNum] = splitKey(key);
     let comments = streamlinedComments[key];
     if (!comments || comments.length === 0) {
-      await handleIssue({ ...params, owner, repo, issueNum: parseInt(issueNum) }, streamlinedComments, seen, key);
+      await handleIssue({ ...params, owner, repo, issueNum: parseInt(issueNum) }, streamlinedComments, seen, key, currentTokenLimits);
       comments = streamlinedComments[key] || [];
     }
 
-    // Process comments while maintaining the relationship to their parent issue
     for (const comment of comments) {
-      await handleComment(params, comment, streamlinedComments, seen, key);
+      await handleComment(params, comment, streamlinedComments, seen, key, currentTokenLimits);
     }
   });
 
