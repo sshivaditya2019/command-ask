@@ -70,12 +70,6 @@ export type GqlIssueCommentSearchResult = {
   node: IssueCommentNode;
 };
 
-export type GqlNodeResponse = {
-  node: {
-    __typename: string;
-  } & (PullRequestNode | PullRequestReviewCommentNode | IssueCommentNode);
-};
-
 export interface PullRequestFile {
   filename: string;
   diffContent: string;

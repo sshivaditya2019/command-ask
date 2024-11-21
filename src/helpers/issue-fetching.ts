@@ -2,15 +2,8 @@ import { Context } from "../types";
 import { IssueComments, FetchParams, Issue, LinkedIssues, ReviewComments, SimplifiedComment, PullRequestDetails } from "../types/github-types";
 import { StreamlinedComment, TokenLimits } from "../types/llm";
 import { logger } from "./errors";
-import {
-  dedupeStreamlinedComments,
-  fetchCodeLinkedFromIssue,
-  idIssueFromComment,
-  mergeStreamlinedComments,
-  splitKey,
-  pullReadmeFromRepoForIssue,
-} from "./issue";
-import { handleIssue, handleSpec, handleSpecAndBodyKeys, throttlePromises } from "./issue-handling";
+import { dedupeStreamlinedComments, fetchCodeLinkedFromIssue, idIssueFromComment, mergeStreamlinedComments, pullReadmeFromRepoForIssue } from "./issue";
+import { handleSpec, handleSpecAndBodyKeys, throttlePromises } from "./issue-handling";
 import { getAllStreamlinedComments } from "../handlers/comments";
 import { processPullRequestDiff } from "./pull-request-parsing";
 
@@ -434,18 +427,6 @@ export async function mergeCommentsAndFetchSpec(
   if (linkedIssue.body) {
     await handleSpec(params, linkedIssue.body, specOrBodies, `${linkedIssue.owner}/${linkedIssue.repo}/${linkedIssue.issueNumber}`, seen, streamlinedComments);
   }
-}
-
-export async function fetchAndHandleIssue(
-  key: string,
-  params: FetchParams,
-  streamlinedComments: Record<string, StreamlinedComment[]>,
-  seen: Set<string>
-): Promise<StreamlinedComment[]> {
-  const [owner, repo, issueNumber] = splitKey(key);
-  const issueParams = { ...params, owner, repo, issueNum: parseInt(issueNumber) };
-  await handleIssue(issueParams, streamlinedComments, seen);
-  return streamlinedComments[key] || [];
 }
 
 function castCommentsToSimplifiedComments(comments: (IssueComments | ReviewComments)[], params: FetchParams): SimplifiedComment[] {

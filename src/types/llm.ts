@@ -45,13 +45,6 @@ export type StreamlinedComment = {
   };
 };
 
-export type StreamlinedComments = {
-  issueNumber: number;
-  repo: string;
-  org: string;
-  comments: StreamlinedComment[];
-};
-
 export type TokenLimits = {
   modelMaxTokenLimit: number;
   maxCompletionTokens: number;
