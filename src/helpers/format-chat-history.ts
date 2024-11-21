@@ -1,9 +1,9 @@
 import { Context } from "../types";
 import { StreamlinedComment, TokenLimits } from "../types/llm";
-import { fetchIssue } from "./issue-fetching";
+import { fetchIssue, fetchLinkedIssues } from "./issue-fetching";
 import { splitKey } from "./issue";
 import { logger } from "./errors";
-import { Issue } from "../types/github-types";
+import { Issue, LinkedIssues } from "../types/github-types";
 import { encode } from "gpt-tokenizer";
 
 interface TreeNode {
@@ -132,17 +132,27 @@ async function buildTree(
   specAndBodies: Record<string, string>,
   tokenLimits: TokenLimits,
   maxDepth: number = 2
-): Promise<TreeNode | null> {
+): Promise<{ tree: TreeNode | null; linkedIssues: LinkedIssues[] }> {
   const processedNodes = new Map<string, TreeNode>();
   const mainIssueKey = `${context.payload.repository.owner.login}/${context.payload.repository.name}/${context.payload.issue.number}`;
-  const linkedIssues = new Set<string>();
+  const linkedIssueKeys = new Set<string>();
   const failedFetches = new Set<string>();
   const processingStack = new Set<string>();
 
   if (!validateGitHubKey(mainIssueKey)) {
     logger.error(`Invalid main issue key: ${mainIssueKey}`);
-    return null;
+    return { tree: null, linkedIssues: [] };
   }
+
+  const { linkedIssues } = await fetchLinkedIssues(
+    {
+      context,
+      owner: context.payload.repository.owner.login,
+      repo: context.payload.repository.name,
+      issueNum: context.payload.issue.number,
+    },
+    tokenLimits
+  );
 
   async function createNode(key: string, depth: number = 0): Promise<TreeNode | null> {
     if (depth > maxDepth || processingStack.has(key)) {
@@ -186,7 +196,7 @@ async function buildTree(
       };
 
       processedNodes.set(key, node);
-      linkedIssues.add(key);
+      linkedIssueKeys.add(key);
 
       const references = new Set<string>();
 
@@ -210,7 +220,7 @@ async function buildTree(
           for (const match of resolveMatches) {
             const number = match.split("#")[1];
             const targetKey = `${owner}/${repo}/${number}`;
-            if (validateGitHubKey(targetKey) && !linkedIssues.has(targetKey)) {
+            if (validateGitHubKey(targetKey) && !linkedIssueKeys.has(targetKey)) {
               references.add(targetKey);
             }
           }
@@ -219,7 +229,7 @@ async function buildTree(
 
       // Process all references regardless of token count
       for (const ref of references) {
-        if (!linkedIssues.has(ref)) {
+        if (!linkedIssueKeys.has(ref)) {
           const childNode = await createNode(ref, depth + 1);
           if (childNode) {
             childNode.parent = node;
@@ -227,7 +237,6 @@ async function buildTree(
           }
         }
       }
-
       return node;
     } catch (error) {
       failedFetches.add(key);
@@ -239,14 +248,15 @@ async function buildTree(
   }
 
   try {
-    return await createNode(mainIssueKey);
+    const tree = await createNode(mainIssueKey);
+    return { tree, linkedIssues };
   } catch (error) {
     logger.error("Error building tree", { error: error as Error });
-    return null;
+    return { tree: null, linkedIssues };
   }
 }
 
-async function processTreeNode(node: TreeNode, prefix: string, output: string[], tokenLimits: TokenLimits): Promise<void> {
+async function processTreeNode(node: TreeNode, prefix: string, output: string[], tokenLimits: TokenLimits, linkedIssues?: LinkedIssues[]): Promise<void> {
   const isPullRequest = node.issue.pull_request;
   const typeStr = isPullRequest ? "PR" : "Issue";
   const numberStr = `#${node.issue.number}`;
@@ -292,23 +302,23 @@ async function processTreeNode(node: TreeNode, prefix: string, output: string[],
     }
   }
 
-  // Add PR diff information if available
-  if (isPullRequest && node.issue.prDetails?.diff) {
-    const diffHeader = `${childPrefix}Diff:`;
-    const diffHeaderTokens = encode(diffHeader, { disallowedSpecial: new Set() }).length;
+  // Add README section for the main issue (no parent)
+  if (!node.parent && linkedIssues?.[0]?.readme) {
+    const readmeHeader = `${childPrefix}README:`;
+    const readmeHeaderTokens = encode(readmeHeader, { disallowedSpecial: new Set() }).length;
 
-    if (tokenLimits.runningTokenCount + diffHeaderTokens <= tokenLimits.tokensRemaining) {
-      updateTokenCount(diffHeader, tokenLimits);
-      output.push(diffHeader);
+    if (tokenLimits.runningTokenCount + readmeHeaderTokens <= tokenLimits.tokensRemaining) {
+      updateTokenCount(readmeHeader, tokenLimits);
+      output.push(readmeHeader);
 
-      const diffLines = node.issue.prDetails.diff.trim().split("\n");
-      for (const line of diffLines) {
+      const readmeLines = linkedIssues[0].readme.trim().split("\n");
+      for (const line of readmeLines) {
         if (line.trim()) {
           const formattedLine = `${contentPrefix}${line.trim()}`;
           const lineTokens = encode(formattedLine, { disallowedSpecial: new Set() }).length;
 
           if (tokenLimits.runningTokenCount + lineTokens > tokenLimits.tokensRemaining) {
-            break; // Stop adding diff lines if we hit the limit
+            break; // Stop adding readme lines if we hit the limit
           }
 
           updateTokenCount(formattedLine, tokenLimits);
@@ -361,7 +371,7 @@ async function processTreeNode(node: TreeNode, prefix: string, output: string[],
       break; // Stop processing children if we can't even add their headers
     }
 
-    await processTreeNode(child, nextPrefix, output, tokenLimits);
+    await processTreeNode(child, nextPrefix, output, tokenLimits, linkedIssues);
   }
 }
 
@@ -380,7 +390,7 @@ export async function formatChatHistory(
 
   tokenLimits.tokensRemaining = tokenLimits.modelMaxTokenLimit - tokenLimits.maxCompletionTokens;
 
-  const tree = await buildTree(context, streamlined, specAndBodies, tokenLimits, maxDepth);
+  const { tree, linkedIssues } = await buildTree(context, streamlined, specAndBodies, tokenLimits, maxDepth);
   if (!tree) {
     return ["No main issue found."];
   }
@@ -395,7 +405,7 @@ export async function formatChatHistory(
   treeOutput.push(headerLine);
   treeOutput.push("");
 
-  await processTreeNode(tree, "", treeOutput, tokenLimits);
+  await processTreeNode(tree, "", treeOutput, tokenLimits, linkedIssues);
   logger.info(`Final token count: ${tokenLimits.runningTokenCount}/${tokenLimits.tokensRemaining} tokens used`);
 
   return treeOutput;

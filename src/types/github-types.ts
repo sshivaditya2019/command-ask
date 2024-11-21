@@ -95,6 +95,7 @@ export interface LinkedIssues {
   comments?: SimplifiedComment[] | null | undefined;
   body: string | undefined | null;
   prDetails?: PullRequestDetails;
+  readme?: string;
 }
 
 export type SimplifiedComment = {

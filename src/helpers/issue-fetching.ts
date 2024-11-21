@@ -8,7 +8,7 @@ import {
   idIssueFromComment,
   mergeStreamlinedComments,
   splitKey,
-  fetchLinkedIssuesFromComment,
+  pullReadmeFromRepoForIssue,
 } from "./issue";
 import { handleIssue, handleSpec, handleSpecAndBodyKeys, throttlePromises } from "./issue-handling";
 import { getAllStreamlinedComments } from "../handlers/comments";
@@ -344,33 +344,22 @@ export async function fetchLinkedIssues(params: FetchParams, tokenLimits?: Token
   };
 
   const allComments = [issueComment, ...comments];
-  const processedUrls = new Set<string>();
 
-  // Fetch similar comments for the issue body
-  if (issue.body) {
-    const similarIssuesFromComments = await fetchLinkedIssuesFromComment(params.context, issue.body, params, currentTokenLimits);
-    for (const similarIssue of similarIssuesFromComments) {
-      const similarKey = `${similarIssue.owner}/${similarIssue.repo}/${similarIssue.issueNumber}`;
-      if (!seen.has(similarKey)) {
-        seen.add(similarKey);
-        linkedIssues.push(similarIssue);
+  // Only fetch README for the main issue (no parent key)
+  if (!params.parentIssueKey) {
+    try {
+      const readmeSection = await pullReadmeFromRepoForIssue(params, currentTokenLimits);
+      if (readmeSection) {
+        linkedIssues[0].readme = readmeSection;
       }
+    } catch (error) {
+      logger.error("Error fetching README:", { error: error as Error });
     }
   }
 
+  const processedUrls = new Set<string>();
   for (const comment of allComments) {
     if (!comment.body) continue;
-
-    // Fetch similar comments for each comment
-    const similarIssuesFromComments = await fetchLinkedIssuesFromComment(params.context, comment.body, params, currentTokenLimits);
-    for (const similarIssue of similarIssuesFromComments) {
-      const similarKey = `${similarIssue.owner}/${similarIssue.repo}/${similarIssue.issueNumber}`;
-      if (!seen.has(similarKey)) {
-        seen.add(similarKey);
-        linkedIssues.push(similarIssue);
-      }
-    }
-
     const foundIssues = idIssueFromComment(comment.body, params);
     const foundCodes = await fetchCodeLinkedFromIssue(comment.body, params.context, comment.issueUrl);
 

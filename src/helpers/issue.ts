@@ -288,6 +288,7 @@ export async function pullReadmeFromRepoForIssue(params: FetchParams, tokenLimit
   } catch (error) {
     throw logger.error(`Error fetching README from repository:`, { stack: error instanceof Error ? error.stack : String(error) });
   }
+  logger.info("Readme fetched from repository");
   return readme;
 }
 

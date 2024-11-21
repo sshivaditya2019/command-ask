@@ -1,7 +1,15 @@
 import { createKey } from "../handlers/comments";
 import { FetchParams, User } from "../types/github-types";
 import { StreamlinedComment, TokenLimits } from "../types/llm";
-import { idIssueFromComment, mergeStreamlinedComments, splitKey, fetchSimilarIssues, fetchCodeLinkedFromIssue, pullReadmeFromRepoForIssue } from "./issue";
+import {
+  idIssueFromComment,
+  mergeStreamlinedComments,
+  splitKey,
+  fetchSimilarIssues,
+  fetchCodeLinkedFromIssue,
+  pullReadmeFromRepoForIssue,
+  fetchLinkedIssuesFromComment,
+} from "./issue";
 import { fetchLinkedIssues, fetchIssue, mergeCommentsAndFetchSpec } from "./issue-fetching";
 import { encode } from "gpt-tokenizer";
 
@@ -71,10 +79,16 @@ export async function handleIssue(
   // Only fetch similar issues and README for the main issue (no parent key)
   if (!parentKey) {
     const issueBody = params.context.payload.issue?.body || "";
-    const [similarIssues, readmeSection] = await Promise.all([fetchSimilarIssues(params.context, issueBody), pullReadmeFromRepoForIssue(params)]);
+    const similarIssues = await fetchSimilarIssues(params.context, issueBody);
+    const readmeSection = await pullReadmeFromRepoForIssue(params);
+
+    params.context.logger.info(`Fetched ${similarIssues.length} similar issues and README section for ${currentKey}`);
+
+    // Fetch Similar Comments
+    const similarIssuesFromComment = await fetchLinkedIssuesFromComment(params.context, issueBody, params);
 
     // Add similar issues at the 0th level
-    linkedIssues.push(...similarIssues);
+    linkedIssues.push(...similarIssues, ...similarIssuesFromComment);
 
     // Add README content as a top-level comment if relevant
     if (readmeSection) {

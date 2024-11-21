@@ -23,7 +23,7 @@ export async function askQuestion(context: Context, question: string) {
   // build a nicely structure system message containing a streamlined chat history
   // includes the current issue, any linked issues, and any linked PRs
   const formattedChat = await formatChatHistory(context, streamlinedComments, specAndBodies, 2);
-  logger.info("Formatted chat history" + formattedChat.join("\n"));
+  logger.info("Formatted chat history " + formattedChat.join("\n"));
   return await askLlm(context, question, formattedChat);
 }
 

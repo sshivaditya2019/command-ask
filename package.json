@@ -17,7 +17,7 @@
     "knip-ci": "knip --no-exit-code --reporter json --config .github/knip.ts",
     "prepare": "husky install",
     "test": "jest --setupFiles dotenv/config --coverage",
-    "worker": "wrangler dev --env dev --port 4000"
+    "worker": "wrangler dev --env dev --port 5000"
   },
   "keywords": [
     "typescript",
