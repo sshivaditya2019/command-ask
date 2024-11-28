@@ -11,14 +11,11 @@ jobs:
     permissions: write-all
 
     steps:
-      - name: Update Manifest and Commit Changes
-        uses: ubiquity-os/action-deploy-plugin@main
-
+      - uses: ubiquity-os/action-deploy-plugin@main
         with:
           treatAsEsm: false
           sourcemap: false
-          pluginEntry: ${{ github.workspace }}/src/main.ts
-          commitMessage: "chore: updated manifest.json and dist build"
-          nodeVersion: "20.10.0"
+          pluginEntry: "${{ github.workspace }}/src/main.ts"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
